@@ -1,3 +1,22 @@
+frotz-llm is a fork of frotz. See full readme info below.
+
+frotz-llm adds a configurable llm interface. The LLM is accessible from within the frotz interface while playing a game. Type '/' followed by a command to use it.  Available commands are:
+
+  /[text]         Same as /next. Interpret freeform user input into available
+                  game parser command. Does only one move.
+  /ask <text>     Ask the LLM with game context
+  /hint           Ask for a spoiler-light hint
+  /next [goal]    Interpret user input into available game parser command.
+                  Does only one move.
+  /play N         Automatically play the next N moves
+  /stop           Stop autopilot
+  /status         Show autopilot and LLM status
+  /set            Show current LLM settings
+  /help           Show this list
+
+
+
+----------------------------------------------------------
 This project has moved to https://gitlab.com/DavidGriffith/frotz
 
 FROTZ V2.45pre - An interpreter for all Infocom and other Z-machine games.
