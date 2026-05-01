@@ -11,7 +11,7 @@ ifneq ($(and $(wildcard $(GIT_DIR)),$(shell which git)),)
 	GIT_BRANCH = $(shell git rev-parse --abbrev-ref HEAD)
 	GIT_HASH = $(shell git rev-parse HEAD)
 	GIT_HASH_SHORT = $(shell git rev-parse --short HEAD)
-	GIT_TAG = $(shell git describe --abbrev=0 --tags)
+	GIT_TAG = $(shell git describe --abbrev=0 --tags 2>/dev/null || echo $(VERSION))
 else
 	GIT_BRANCH = none
 	GIT_HASH = none
@@ -26,6 +26,10 @@ export CFLAGS
 
 # Enable compiler warnings. This is an absolute minimum.
 CFLAGS += -Wall -std=c99 #-Wextra 
+
+# This codebase relies on legacy common symbol semantics.
+# GCC 10+ defaults to -fno-common, which causes multiple-definition link errors.
+CFLAGS += -fcommon
 
 # strdup, strndup
 CFLAGS += -D_POSIX_C_SOURCE=200809L
@@ -55,8 +59,24 @@ LDFLAGS += -L$(LIBDIR)
 RANLIB ?= $(shell which ranlib)
 
 # Choose your sound support
-# OPTIONS: ao, none
-export SOUND ?= ao
+# OPTIONS: auto, ao, none
+SOUND ?= auto
+
+# Default behavior: use libao audio if the required development packages are
+# available, otherwise build with NO_SOUND so make works out of the box.
+ifeq ($(SOUND), auto)
+ifneq ($(shell which pkg-config 2>/dev/null),)
+ifneq ($(shell pkg-config --exists ao sndfile vorbisfile libmodplug samplerate && echo yes),)
+SOUND := ao
+else
+SOUND := none
+endif
+else
+SOUND := none
+endif
+endif
+
+export SOUND
 
 # Default sample rate for sound effects.
 # All modern sound interfaces can be expected to support 44100 Hz sample
@@ -130,11 +150,30 @@ SDL_LIB = $(SDL_DIR)/frotz_sdl.a
 export SDL_PKGS = libpng libjpeg sdl2 SDL2_mixer freetype2 zlib
 SDL_LDFLAGS = `pkg-config $(SDL_PKGS) --libs` -lm
 
+# Build sfrotz only when SDL dependencies are available.
+BUILD_SDL ?= auto
+ifeq ($(BUILD_SDL), auto)
+ifneq ($(shell which pkg-config 2>/dev/null),)
+ifneq ($(shell pkg-config --exists $(SDL_PKGS) && echo yes),)
+BUILD_SDL := yes
+else
+BUILD_SDL := no
+endif
+else
+BUILD_SDL := no
+endif
+endif
+
 
 SUBDIRS = $(COMMON_DIR) $(CURSES_DIR) $(SDL_DIR) $(DUMB_DIR) $(BLORB_DIR)
 SUB_CLEAN = $(SUBDIRS:%=%-clean)
 
-all: frotz dfrotz sfrotz
+ALL_TARGETS = frotz dfrotz
+ifeq ($(BUILD_SDL), yes)
+ALL_TARGETS += sfrotz
+endif
+
+all: $(ALL_TARGETS)
 
 $(COMMON_LIB): $(COMMON_DEFINES) $(HASH) $(COMMON_DIR);
 $(CURSES_LIB): $(CURSES_DEFINES) $(CURSES_DIR);
@@ -258,6 +297,11 @@ help:
 	@echo "Targets:"
 	@echo "    frotz: the standard edition"
 	@echo "    dfrotz: for dumb terminals and wrapper scripts"
+	@echo "Variables:"
+	@echo "    SOUND=auto|ao|none (default: auto)"
+	@echo "      auto: use ao when detected, otherwise no sound"
+	@echo "    BUILD_SDL=auto|yes|no (default: auto)"
+	@echo "      auto: build sfrotz only when SDL deps are detected"
 	@echo "    install"
 	@echo "    uninstall"
 	@echo "    install_dfrotz"
