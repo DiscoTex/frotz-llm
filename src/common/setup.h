@@ -33,6 +33,14 @@ typedef struct frotz_setup_struct {
 	char *restricted_path;
 	int restore_mode; /* for a save file passed from command line*/
 
+	char *llm_provider;
+	char *llm_model;
+	char *llm_base_url;
+	char *llm_api_key;
+	char *llm_mode;
+	char *llm_test_prompt;
+	int llm_context_lines;
+
 	bool use_blorb;
 	bool exec_in_blorb;
 } f_setup_t;

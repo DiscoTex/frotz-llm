@@ -25,6 +25,7 @@
  */
 
 #include "frotz.h"
+#include "llm.h"
 
 #ifndef MSDOS_16BIT
 #define cdecl
@@ -145,9 +146,35 @@ void z_piracy (void)
  */
 int cdecl main (int argc, char *argv[])
 {
+    char llm_response[8192];
+    char llm_error[4096];
+
     os_init_setup ();
 
+    if (!llm_load_config(NULL, llm_error, sizeof(llm_error))) {
+        fprintf(stderr, "LLM config error: %s\n", llm_error);
+        return 1;
+    }
+
     os_process_arguments (argc, argv);
+
+    if (llm_mode_is_test() && f_setup.llm_test_prompt != NULL) {
+        if (!llm_run_prompt(f_setup.llm_provider,
+                            f_setup.llm_model,
+                            f_setup.llm_base_url,
+                            f_setup.llm_api_key,
+                            f_setup.llm_test_prompt,
+                            llm_response,
+                            sizeof(llm_response),
+                            llm_error,
+                            sizeof(llm_error))) {
+            fprintf(stderr, "LLM request failed: %s\n", llm_error);
+            return 1;
+        }
+
+        puts(llm_response);
+        return 0;
+    }
 
     init_buffer ();
 

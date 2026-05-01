@@ -19,6 +19,7 @@
  */
 
 #include "frotz.h"
+#include "llm.h"
 
 extern bool handle_hot_key (zchar);
 
@@ -144,6 +145,8 @@ void z_output_stream (void)
  */
 void stream_char (zchar c)
 {
+    llm_capture_output_char(c);
+
     if (ostream_screen)
 	screen_char (c);
     if (ostream_script && enable_scripting)
@@ -160,6 +163,8 @@ void stream_char (zchar c)
  */
 void stream_word (const zchar *s)
 {
+    llm_capture_output_word(s);
+
     if (ostream_memory && !message)
 
 	memory_word (s);
@@ -184,6 +189,8 @@ void stream_word (const zchar *s)
  */
 void stream_new_line (void)
 {
+    llm_capture_output_new_line();
+
     if (ostream_memory && !message)
 	memory_new_line ();
 
@@ -324,6 +331,8 @@ continue_input:
 
     if (ostream_record && !istream_replay)
 	record_write_input (buf, key);
+
+    llm_capture_user_input(buf, key);
 
     /* Handle timeouts */
 

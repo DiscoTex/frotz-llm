@@ -64,7 +64,7 @@ Syntax: frotz [options] story-file\n\
   -i   ignore fatal errors        \t -u # slots for multiple undo\n\
   -l # left margin                \t -v   show version information\n\
   -L <file> load this save file   \t -w # screen width\n\
-  -o   watch object movement      \t -x   expand abbreviations g/x/z\n"
+	 -o   watch object movement      \t -x   expand abbreviations g/x/z\n"
 
 /*
 char stripped_story_name[FILENAME_MAX+1];
@@ -295,7 +295,10 @@ void os_process_arguments (int argc, char *argv[])
 
     } while (c != EOF);
 
-    if (zoptind != argc - 1) {
+	if (zoptind == argc && f_setup.llm_test_prompt != NULL)
+	return;
+
+	if (zoptind != argc - 1) {
 	printf("FROTZ V%s\t", frotz_version);
 
 #ifndef NO_SOUND
@@ -1047,6 +1050,13 @@ void os_init_setup(void)
 	f_setup.sound = 1;
 	f_setup.err_report_mode = ERR_DEFAULT_REPORT_MODE;
 	f_setup.restore_mode = 0;
+	f_setup.llm_provider = NULL;
+	f_setup.llm_model = NULL;
+	f_setup.llm_base_url = NULL;
+	f_setup.llm_api_key = NULL;
+	f_setup.llm_mode = NULL;
+	f_setup.llm_test_prompt = NULL;
+	f_setup.llm_context_lines = 16;
 
 	f_setup.use_blorb = 0;
 	f_setup.exec_in_blorb = 0;

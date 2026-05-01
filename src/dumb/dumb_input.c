@@ -20,39 +20,47 @@
  */
 
 #include <string.h>
+#include <ctype.h>
 
 #include "dumb_frotz.h"
+#include "../common/llm.h"
 
 f_setup_t f_setup;
 
 static char runtime_usage[] =
   "DUMB-FROTZ runtime help:\n"
   "  General Commands:\n"
-  "    \\help    Show this message.\n"
-  "    \\set     Show the current values of runtime settings.\n"
-  "    \\s       Show the current contents of the whole screen.\n"
-  "    \\d       Discard the part of the input before the cursor.\n"
-  "    \\wN      Advance clock N/10 seconds, possibly causing the current\n"
-  "                and subsequent inputs to timeout.\n"
-  "    \\w       Advance clock by the amount of real time since this input\n"
-  "                started (times the current speed factor).\n"
-  "    \\t       Advance clock just enough to timeout the current input\n"
+  "    /help            Show this message.\n"
+  "    /set             Show current settings.\n"
+  "    /ask <text>      Ask the LLM using recent game context.\n"
+  "    /hint            Ask for one concise, low-spoiler hint.\n"
+  "    /next [goal]     Suggest one next parser command (no autopilot).\n"
+  "    /play N          Iteratively execute next N moves.\n"
+  "    /stop            Stop autopilot.\n"
+  "    /status          Show autopilot status.\n"
+  "    /s               Show the current contents of the whole screen.\n"
+  "    /d               Discard the part of the input before the cursor.\n"
+  "    /wN              Advance clock N/10 seconds, possibly causing the current\n"
+  "                        and subsequent inputs to timeout.\n"
+  "    /w               Advance clock by the amount of real time since this input\n"
+  "                        started (times the current speed factor).\n"
+  "    /t               Advance clock just enough to timeout the current input\n"
   "  Reverse-Video Display Method Settings:\n"
-  "    \\rn   none    \\rc   CAPS    \\rd   doublestrike    \\ru   underline\n"
-  "    \\rbC  show rv blanks as char C (orthogonal to above modes)\n"
+  "    /rn   none    /rc   CAPS    /rd   doublestrike    /ru   underline\n"
+  "    /rbC  show rv blanks as char C (orthogonal to above modes)\n"
   "  Output Compression Settings:\n"
-  "    \\cn      none: show whole screen before every input.\n"
-  "    \\cm      max: show only lines that have new nonblank characters.\n"
-  "    \\cs      spans: like max, but emit a blank line between each span of\n"
+  "    /cn      none: show whole screen before every input.\n"
+  "    /cm      max: show only lines that have new nonblank characters.\n"
+  "    /cs      spans: like max, but emit a blank line between each span of\n"
   "                screen lines shown.\n"
-  "    \\chN     Hide top N lines (orthogonal to above modes).\n"
+  "    /chN     Hide top N lines (orthogonal to above modes).\n"
   "  Misc Settings:\n"
-  "    \\sfX     Set speed factor to X.  (0 = never timeout automatically).\n"
-  "    \\mp      Toggle use of MORE prompts\n"
-  "    \\ln      Toggle display of line numbers.\n"
-  "    \\lt      Toggle display of the line type identification chars.\n"
-  "    \\vb      Toggle visual bell.\n"
-  "    \\pb      Toggle display of picture outline boxes.\n"
+  "    /sfX     Set speed factor to X.  (0 = never timeout automatically).\n"
+  "    /mp      Toggle use of MORE prompts\n"
+  "    /ln      Toggle display of line numbers.\n"
+  "    /lt      Toggle display of the line type identification chars.\n"
+  "    /vb      Toggle visual bell.\n"
+  "    /pb      Toggle display of picture outline boxes.\n"
   "    (Toggle commands can be followed by a 1 or 0 to set value ON or OFF.)\n"
   "  Character Escapes:\n"
   "    \\\\  backslash    \\#  backspace    \\[  escape    \\_  return\n"
@@ -64,7 +72,7 @@ static char runtime_usage[] =
   "      >        T      A regular line-oriented input\n"
   "      )        t      A single-character input\n"
   "      }        D      A line input with some input before the cursor.\n"
-  "                         (Use \\d to discard it.)\n"
+  "                         (Use /d to discard it.)\n"
   "    Output lines:\n"
   "      ]     Output line that contains the cursor.\n"
   "      .     A blank line emitted as part of span compression.\n"
@@ -147,7 +155,7 @@ static void translate_special_chars(char *s)
       case '0': *dest++ = ZC_FKEY_MIN + 9; break;
       default:
 	fprintf(stderr, "DUMB-FROTZ: unknown escape char: %c\n", src[-1]);
-	fprintf(stderr, "Enter \\help to see the list\n");
+  fprintf(stderr, "Enter /help to see the list\n");
       }
     }
   *dest = '\0';
@@ -176,6 +184,73 @@ static void toggle(bool *var, char val)
     *var = val == '1' || (val != '0' && !*var);
 }
 
+static bool llm_command_looks_json(const char *s)
+{
+  while (s != NULL && *s != '\0' && isspace((unsigned char)*s))
+    s++;
+
+  return s != NULL && (*s == '{' || *s == '[');
+}
+
+static bool llm_extract_next_command(const char *response, char *out, size_t out_size)
+{
+  const char *p;
+  const char *end;
+  size_t n;
+
+  if (response == NULL || out == NULL || out_size == 0)
+    return FALSE;
+
+  p = response;
+  while (*p != '\0' && isspace((unsigned char)*p))
+    p++;
+
+  if (p[0] == '`' && p[1] == '`' && p[2] == '`') {
+    while (*p != '\0' && *p != '\n')
+      p++;
+    while (*p == '\n' || *p == '\r')
+      p++;
+  }
+
+  end = p;
+  while (*end != '\0' && *end != '\n' && *end != '\r')
+    end++;
+  while (end > p && isspace((unsigned char)end[-1]))
+    end--;
+
+  if (end <= p)
+    return FALSE;
+
+  n = (size_t)(end - p);
+  if (n >= out_size)
+    n = out_size - 1;
+  memcpy(out, p, n);
+  out[n] = '\0';
+
+  if (llm_command_looks_json(out))
+    return FALSE;
+
+  return out[0] != '\0';
+}
+
+static int llm_play_remaining = 0;
+
+static bool llm_next_command_query(char *out_cmd, size_t out_size, char *error, size_t error_size)
+{
+  const char *query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+  char response[8192];
+
+  if (!llm_query_with_context(query, response, sizeof(response), error, error_size))
+    return FALSE;
+
+  if (!llm_extract_next_command(response, out_cmd, out_size)) {
+    (void)snprintf(error, error_size, "couldn't extract a parser command from LLM response");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 /* Handle input-related user settings and call dumb_output_handle_setting.  */
 bool dumb_handle_setting(const char *setting, bool show_cursor, bool startup)
 {
@@ -195,7 +270,7 @@ bool dumb_handle_setting(const char *setting, bool show_cursor, bool startup)
     return TRUE;
 }
 
-/* Read a line, processing commands (lines that start with a backslash
+/* Read a line, processing commands (lines that start with a slash
  * (that isn't the start of a special character)), and write the
  * first non-command to s.
  * Return true if timed-out.  */
@@ -217,6 +292,61 @@ static bool dumb_read_line(char *s, char *prompt, bool show_cursor,
 
   dumb_show_screen(show_cursor);
   for (;;) {
+    if (llm_agent_is_active()) {
+      char auto_cmd[INPUT_BUFFER_SIZE];
+      char status[2048];
+      char error[4096];
+
+      if (llm_agent_next_command(auto_cmd, sizeof(auto_cmd), status, sizeof(status), error, sizeof(error))) {
+  if (llm_command_looks_json(auto_cmd)) {
+    llm_agent_stop();
+    fprintf(stdout, "LLM agent error: rejected non-parser action: %s\n", auto_cmd);
+    continue;
+  }
+	fprintf(stdout, "[LLM->game] %s\n", auto_cmd);
+      {
+        size_t n = strnlen(auto_cmd, INPUT_BUFFER_SIZE - 2);
+        memcpy(s, auto_cmd, n);
+        s[n++] = '\n';
+        s[n] = '\0';
+      }
+	return FALSE;
+      }
+
+	if (status[0] != '\0')
+	  fprintf(stdout, "[LLM] %s\n", status);
+	if (error[0] != '\0')
+	  fprintf(stdout, "LLM agent error: %s\n", error);
+    }
+
+    if (llm_play_remaining > 0) {
+      char play_cmd[INPUT_BUFFER_SIZE];
+      char play_error[4096];
+
+      if (!llm_mode_is_interactive()) {
+        llm_play_remaining = 0;
+        fputs("[LLM] /play stopped: interactive mode disabled.\n", stdout);
+      } else {
+        fputs("[LLM] Waiting for response...\n", stdout);
+        if (!llm_next_command_query(play_cmd, sizeof(play_cmd), play_error, sizeof(play_error))) {
+          llm_play_remaining = 0;
+          fprintf(stdout, "LLM error: %s\n", play_error);
+        } else {
+          size_t n;
+          llm_play_remaining--;
+          fprintf(stdout, "[LLM->game] %s (%d move%s left)\n",
+                  play_cmd,
+                  llm_play_remaining,
+                  llm_play_remaining == 1 ? "" : "s");
+          n = strnlen(play_cmd, INPUT_BUFFER_SIZE - 2);
+          memcpy(s, play_cmd, n);
+          s[n++] = '\n';
+          s[n] = '\0';
+          return FALSE;
+        }
+      }
+    }
+
     char *command;
     if (prompt)
       fputs(prompt, stdout);
@@ -225,7 +355,7 @@ static bool dumb_read_line(char *s, char *prompt, bool show_cursor,
     /* Prompt only shows up after user input if we don't flush stdout */
     fflush(stdout);
     dumb_getline(s);
-    if ((s[0] != '\\') || ((s[1] != '\0') && !islower(s[1]))) {
+    if ((s[0] != '/') || ((s[1] != '\0') && (s[1] != '\n') && !islower((unsigned char)s[1]))) {
       /* Is not a command line.  */
       translate_special_chars(s);
       if (timeout) {
@@ -239,11 +369,21 @@ static bool dumb_read_line(char *s, char *prompt, bool show_cursor,
     }
     /* Commands.  */
 
-    /* Remove the \ and the terminating newline.  */
+    /* Remove the / and the terminating newline.  */
     command = s + 1;
     command[strlen(command) - 1] = '\0';
 
-    if (!strcmp(command, "t")) {
+    if (!strcmp(command, "")) {
+      fputs("\nAvailable commands:\n", stdout);
+      fputs("  /help           Show this list\n", stdout);
+      fputs("  /set            Show current settings\n", stdout);
+      fputs("  /ask <text>     Ask the LLM with game context\n", stdout);
+      fputs("  /hint           Ask for a spoiler-light hint\n", stdout);
+      fputs("  /next [goal]    Suggest one next parser command\n", stdout);
+      fputs("  /play N         Iteratively execute next N moves\n", stdout);
+      fputs("  /stop           Stop autopilot\n", stdout);
+      fputs("  /status         Show autopilot status\n", stdout);
+    } else if (!strcmp(command, "t")) {
       if (timeout) {
 	time_ahead = 0;
 	s[0] = '\0';
@@ -293,11 +433,153 @@ static bool dumb_read_line(char *s, char *prompt, bool show_cursor,
 	    break;
 	}
       }
+    } else if (!strcmp(command, "set")) {
+      const char *provider = f_setup.llm_provider && *f_setup.llm_provider ? f_setup.llm_provider : "(unset)";
+      const char *model    = f_setup.llm_model    && *f_setup.llm_model    ? f_setup.llm_model    : "(default)";
+      const char *mode     = f_setup.llm_mode     && *f_setup.llm_mode     ? f_setup.llm_mode     : "off";
+      fprintf(stdout, "Settings:\n  provider:      %s\n  model:         %s\n  mode:          %s\n  context_lines: %d\n",
+              provider, model, mode,
+              f_setup.llm_context_lines > 0 ? f_setup.llm_context_lines : 16);
+        } else if (!strncmp(command, "ask", 3) && (command[3] == '\0' || isspace((unsigned char)command[3]))) {
+      const char *query;
+      char response[8192];
+      char error[4096];
+      char *args = command + 3;
+      while (*args != '\0' && isspace((unsigned char)*args)) args++;
+      if (!llm_mode_is_interactive()) { fputs("LLM interactive mode disabled.\n", stdout); continue; }
+      query = (*args == '\0') ? "Give one concise suggestion for what to try next." : args;
+          fputs("[LLM] Waiting for response...\n", stdout);
+      if (!llm_query_with_context(query, response, sizeof(response), error, sizeof(error)))
+        fprintf(stdout, "LLM error: %s\n", error);
+      else
+            fprintf(stdout, "[LLM] (%ld ms, %d attempt%s) %s\n",
+                    llm_last_latency_ms(),
+                    llm_last_attempts(),
+                    llm_last_attempts() == 1 ? "" : "s",
+                    response);
+    } else if (!strncmp(command, "hint", 4) && (command[4] == '\0' || isspace((unsigned char)command[4]))) {
+      char response[8192];
+      char error[4096];
+      if (!llm_mode_is_interactive()) { fputs("LLM interactive mode disabled.\n", stdout); continue; }
+          fputs("[LLM] Waiting for response...\n", stdout);
+      if (!llm_query_with_context("Give exactly one concise hint based on context. Avoid major spoilers.", response, sizeof(response), error, sizeof(error)))
+        fprintf(stdout, "LLM error: %s\n", error);
+      else
+            fprintf(stdout, "[LLM] (%ld ms, %d attempt%s) %s\n",
+                    llm_last_latency_ms(),
+                    llm_last_attempts(),
+                    llm_last_attempts() == 1 ? "" : "s",
+                    response);
+    } else if (!strncmp(command, "next", 4) && (command[4] == '\0' || isspace((unsigned char)command[4]))) {
+      const char *query;
+      char response[8192];
+      char next_cmd[INPUT_BUFFER_SIZE];
+      char error[4096];
+      char querybuf[1024];
+      char *goal = command + 4;
+      while (*goal != '\0' && isspace((unsigned char)*goal)) goal++;
+      if (!llm_mode_is_interactive()) { fputs("LLM interactive mode disabled.\n", stdout); continue; }
+      if (*goal == '\0')
+        query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+      else {
+        (void)snprintf(querybuf, sizeof(querybuf),
+                       "Goal: %s\\nSuggest exactly one safe next parser command. Return only the command text.",
+                       goal);
+        query = querybuf;
+      }
+      fputs("[LLM] Waiting for response...\n", stdout);
+      if (!llm_query_with_context(query, response, sizeof(response), error, sizeof(error)))
+        fprintf(stdout, "LLM error: %s\n", error);
+      else {
+        fprintf(stdout, "[LLM] (%ld ms, %d attempt%s) %s\n",
+                llm_last_latency_ms(),
+                llm_last_attempts(),
+                llm_last_attempts() == 1 ? "" : "s",
+                response);
+        if (!llm_extract_next_command(response, next_cmd, sizeof(next_cmd))) {
+          fputs("LLM error: couldn't extract a parser command from /next response.\n", stdout);
+          continue;
+        }
+        fprintf(stdout, "[LLM->game] %s\n", next_cmd);
+        {
+          size_t n = strnlen(next_cmd, INPUT_BUFFER_SIZE - 2);
+          memcpy(s, next_cmd, n);
+          s[n++] = '\n';
+          s[n] = '\0';
+        }
+        return FALSE;
+      }
+          } else if (!strncmp(command, "play", 4) && (command[4] == '\0' || isspace((unsigned char)command[4]))) {
+            char *args = command + 4;
+            char *endptr = NULL;
+            long n;
+            while (*args != '\0' && isspace((unsigned char)*args)) args++;
+            if (!llm_mode_is_interactive()) { fputs("LLM interactive mode disabled.\n", stdout); continue; }
+            if (*args == '\0') { fputs("Usage: /play N\n", stdout); continue; }
+            n = strtol(args, &endptr, 10);
+            while (endptr != NULL && *endptr != '\0' && isspace((unsigned char)*endptr)) endptr++;
+            if (endptr == args || (endptr != NULL && *endptr != '\0') || n <= 0 || n > 1000) {
+              fputs("Usage: /play N (1..1000)\n", stdout);
+              continue;
+            }
+            llm_play_remaining = (int)n;
+            fprintf(stdout, "[LLM] Queued %d move%s via /play.\n",
+                    llm_play_remaining,
+                    llm_play_remaining == 1 ? "" : "s");
+    } else if (!strncmp(command, "do", 2) && (command[2] == '\0' || isspace((unsigned char)command[2]))) {
+      fputs("[LLM] /do is temporarily disabled. Use /next [goal] for one-step guidance.\n", stdout);
+    } else if (!strcmp(command, "stop")) {
+      llm_agent_stop();
+            llm_play_remaining = 0;
+      fputs("[LLM] Autopilot stopped.\n", stdout);
+    } else if (!strcmp(command, "status")) {
+            if (llm_play_remaining > 0)
+              fprintf(stdout, "[LLM] /play has %d move%s remaining.\n",
+                      llm_play_remaining,
+                      llm_play_remaining == 1 ? "" : "s");
+      fprintf(stdout, "[LLM] Autopilot is %s.\n", llm_agent_is_active() ? "active" : "inactive");
     } else if (!strcmp(command, "s")) {
 	dumb_dump_screen();
     } else if (!dumb_handle_setting(command, show_cursor, FALSE)) {
-      fprintf(stderr, "DUMB-FROTZ: unknown command: %s\n", s);
-      fprintf(stderr, "Enter \\help to see the list of commands\n");
+      const char *query;
+      char response[8192];
+      char next_cmd[INPUT_BUFFER_SIZE];
+      char error[4096];
+      char querybuf[1024];
+      char *goal = command;
+      while (*goal != '\0' && isspace((unsigned char)*goal)) goal++;
+      if (!llm_mode_is_interactive()) { fputs("LLM interactive mode disabled.\n", stdout); continue; }
+      if (*goal == '\0')
+        query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+      else {
+        (void)snprintf(querybuf, sizeof(querybuf),
+                       "Goal: %s\\nSuggest exactly one safe next parser command. Return only the command text.",
+                       goal);
+        query = querybuf;
+      }
+      fprintf(stdout, "[LLM] Treating /%s as /next %s\n", command, goal);
+      fputs("[LLM] Waiting for response...\n", stdout);
+      if (!llm_query_with_context(query, response, sizeof(response), error, sizeof(error))) {
+        fprintf(stdout, "LLM error: %s\n", error);
+        continue;
+      }
+      fprintf(stdout, "[LLM] (%ld ms, %d attempt%s) %s\n",
+              llm_last_latency_ms(),
+              llm_last_attempts(),
+              llm_last_attempts() == 1 ? "" : "s",
+              response);
+      if (!llm_extract_next_command(response, next_cmd, sizeof(next_cmd))) {
+        fputs("LLM error: couldn't extract a parser command from /next response.\n", stdout);
+        continue;
+      }
+      fprintf(stdout, "[LLM->game] %s\n", next_cmd);
+      {
+        size_t n = strnlen(next_cmd, INPUT_BUFFER_SIZE - 2);
+        memcpy(s, next_cmd, n);
+        s[n++] = '\n';
+        s[n] = '\0';
+      }
+      return FALSE;
     }
   }
 }

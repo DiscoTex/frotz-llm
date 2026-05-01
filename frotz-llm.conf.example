@@ -1,0 +1,35 @@
+# Copy to ~/.frotz-llm.conf or point FROTZ_LLM_CONFIG at your custom path.
+# Keys are case-insensitive.
+
+# provider: openai | openrouter | lmstudio | anthropic | github-models
+provider = lmstudio
+
+# mode: off | test | interactive
+# off: no LLM calls during gameplay
+# test: run test_prompt at startup then exit
+# interactive: enable in-game /llm ask / /llm hint commands
+mode = off
+
+# Model name for your provider.
+model = local-model
+
+# Optional endpoint override.
+# base_url = http://127.0.0.1:1234/v1/chat/completions
+
+# API key for hosted providers (OpenAI/OpenRouter/Anthropic/GitHub Models).
+# For provider = github-models, use a GitHub token with models:read.
+# api_key = sk-...
+
+# Optional GitHub Models organization attribution.
+# github_org = your-org-login
+# github_api_version = 2026-03-10
+
+# Optional startup test prompt (used when mode = test)
+# test_prompt = Say hello in five words
+
+# Number of recent game output lines to include in interactive prompts.
+# context_lines = 16
+
+# OpenRouter optional metadata.
+# openrouter_referer = https://your-app.example
+# openrouter_title = frotz-llm

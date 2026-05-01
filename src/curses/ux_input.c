@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <limits.h>
 
 #include <errno.h>
@@ -38,9 +39,243 @@
 #endif
 
 #include "ux_frotz.h"
+#include "../common/llm.h"
 
 static int start_of_prev_word(int, const zchar*);
 static int end_of_next_word(int, const zchar*, int);
+
+static const char *runtime_first_nonempty(const char *a, const char *b, const char *fallback)
+{
+	if (a != NULL && *a != '\0')
+		return a;
+	if (b != NULL && *b != '\0')
+		return b;
+	return fallback;
+}
+
+static int llm_command_looks_json(const char *s)
+{
+	while (s != NULL && *s != '\0' && isspace((unsigned char)*s))
+		s++;
+
+	return s != NULL && (*s == '{' || *s == '[');
+}
+
+static int llm_extract_next_command(const char *response, char *out, size_t out_size)
+{
+	const char *p;
+	const char *end;
+	size_t n;
+
+	if (response == NULL || out == NULL || out_size == 0)
+		return 0;
+
+	p = response;
+	while (*p != '\0' && isspace((unsigned char)*p))
+		p++;
+
+	if (p[0] == '`' && p[1] == '`' && p[2] == '`') {
+		while (*p != '\0' && *p != '\n')
+			p++;
+		while (*p == '\n' || *p == '\r')
+			p++;
+	}
+
+	end = p;
+	while (*end != '\0' && *end != '\n' && *end != '\r')
+		end++;
+	while (end > p && isspace((unsigned char)end[-1]))
+		end--;
+
+	if (end <= p)
+		return 0;
+
+	n = (size_t)(end - p);
+	if (n >= out_size)
+		n = out_size - 1;
+	memcpy(out, p, n);
+	out[n] = '\0';
+
+	if (llm_command_looks_json(out))
+		return 0;
+
+	return out[0] != '\0';
+}
+
+static int llm_play_remaining = 0;
+
+static int llm_next_command_query(char *out_cmd, size_t out_size, char *error, size_t error_size)
+{
+	char response[8192];
+	const char *query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+
+	if (!llm_query_with_context(query, response, sizeof(response), error, error_size))
+		return 0;
+
+	if (!llm_extract_next_command(response, out_cmd, out_size)) {
+		(void)snprintf(error, error_size, "couldn't extract a parser command from LLM response");
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Return values:
+ * 0 = not an LLM runtime command
+ * 1 = handled in-place (show output, keep reading)
+ * 2 = handled and injected a command into buf (execute it now)
+ */
+static int handle_llm_runtime_line(zchar *buf, int bufmax)
+{
+	char *line = (char *)buf;
+	const char *query = NULL;
+	char response[8192];
+	char next_cmd[512];
+	char error[4096];
+	char *args;
+	int next_mode = 0;
+
+	/* Helper: advance past the command word to its arguments. */
+#define CMD_ARGS(cmd) (line + sizeof(cmd) - 1 + strspn(line + sizeof(cmd) - 1, " \t"))
+
+	if (strcmp(line, "/") == 0 || strcmp(line, "/help") == 0) {
+		print_string("\nAvailable commands:\n");
+		print_string("  /help           Show this list\n");
+		print_string("  /set            Show current settings\n");
+		print_string("  /ask <text>     Ask the LLM with game context\n");
+		print_string("  /hint           Ask for a spoiler-light hint\n");
+		print_string("  /next [goal]    Suggest one next parser command\n");
+		print_string("  /play N         Iteratively execute next N moves\n");
+		print_string("  /stop           Stop autopilot\n");
+		print_string("  /status         Show autopilot status\n");
+		return 1;
+	}
+
+	if (strcmp(line, "/set") == 0) {
+		char linebuf[512];
+		const char *provider = runtime_first_nonempty(f_setup.llm_provider, getenv("FROTZ_LLM_PROVIDER"), "(unset)");
+		const char *model    = runtime_first_nonempty(f_setup.llm_model,    getenv("FROTZ_LLM_MODEL"),    "(default)");
+		const char *mode     = runtime_first_nonempty(f_setup.llm_mode,     getenv("FROTZ_LLM_MODE"),     "off");
+		print_string("\nSettings:\n");
+		(void)snprintf(linebuf, sizeof(linebuf), "  provider:      %s\n", provider); print_string(linebuf);
+		(void)snprintf(linebuf, sizeof(linebuf), "  model:         %s\n", model);    print_string(linebuf);
+		(void)snprintf(linebuf, sizeof(linebuf), "  mode:          %s\n", mode);     print_string(linebuf);
+		(void)snprintf(linebuf, sizeof(linebuf), "  context_lines: %d\n", f_setup.llm_context_lines > 0 ? f_setup.llm_context_lines : 16);
+		print_string(linebuf);
+		return 1;
+	}
+
+	if (strncmp(line, "/ask", 4) == 0 && (line[4] == '\0' || line[4] == ' ' || line[4] == '\t')) {
+		if (!llm_mode_is_interactive()) { print_string("\nLLM interactive mode disabled.\n"); return 1; }
+		args = CMD_ARGS("/ask");
+		query = (*args == '\0') ? "Give one concise suggestion for what to try next." : args;
+	} else if (strncmp(line, "/hint", 5) == 0 && (line[5] == '\0' || line[5] == ' ' || line[5] == '\t')) {
+		if (!llm_mode_is_interactive()) { print_string("\nLLM interactive mode disabled.\n"); return 1; }
+		query = "Give exactly one concise hint based on context. Avoid major spoilers.";
+	} else if (strncmp(line, "/next", 5) == 0 && (line[5] == '\0' || line[5] == ' ' || line[5] == '\t')) {
+		if (!llm_mode_is_interactive()) { print_string("\nLLM interactive mode disabled.\n"); return 1; }
+		next_mode = 1;
+		args = CMD_ARGS("/next");
+		if (*args == '\0') {
+			query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+		} else {
+			static char next_query[1024];
+			(void)snprintf(next_query, sizeof(next_query),
+			               "Goal: %s\nSuggest exactly one safe next parser command. Return only the command text.",
+			               args);
+			query = next_query;
+		}
+	} else if (strncmp(line, "/play", 5) == 0 && (line[5] == '\0' || line[5] == ' ' || line[5] == '\t')) {
+		char *endptr = NULL;
+		long n;
+		if (!llm_mode_is_interactive()) { print_string("\nLLM interactive mode disabled.\n"); return 1; }
+		args = CMD_ARGS("/play");
+		if (*args == '\0') { print_string("\nUsage: /play N\n"); return 1; }
+		n = strtol(args, &endptr, 10);
+		while (endptr != NULL && *endptr != '\0' && isspace((unsigned char)*endptr)) endptr++;
+		if (endptr == args || (endptr != NULL && *endptr != '\0') || n <= 0 || n > 1000) {
+			print_string("\nUsage: /play N (1..1000)\n");
+			return 1;
+		}
+		llm_play_remaining = (int)n;
+		{
+			char linebuf[128];
+			(void)snprintf(linebuf, sizeof(linebuf), "\n[LLM] Queued %d move%s via /play.\n", llm_play_remaining, llm_play_remaining == 1 ? "" : "s");
+			print_string(linebuf);
+		}
+		return 1;
+	} else if (strncmp(line, "/do", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t')) {
+		print_string("\n[LLM] /do is temporarily disabled. Use /next [goal] for one-step guidance.\n");
+		return 1;
+	} else if (strncmp(line, "/stop", 5) == 0 && (line[5] == '\0' || line[5] == ' ' || line[5] == '\t')) {
+		llm_agent_stop();
+		llm_play_remaining = 0;
+		print_string("\n[LLM] Autopilot stopped.\n");
+		return 1;
+	} else if (strncmp(line, "/status", 7) == 0 && (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+		if (llm_play_remaining > 0) {
+			char linebuf[128];
+			(void)snprintf(linebuf, sizeof(linebuf), "\n[LLM] /play has %d move%s remaining.\n", llm_play_remaining, llm_play_remaining == 1 ? "" : "s");
+			print_string(linebuf);
+		}
+		print_string(llm_agent_is_active() ? "\n[LLM] Autopilot is active.\n" : "\n[LLM] Autopilot is inactive.\n");
+		return 1;
+	} else {
+		if (line[0] == '/') {
+			if (!llm_mode_is_interactive()) { print_string("\nLLM interactive mode disabled.\n"); return 1; }
+			next_mode = 1;
+			args = line + 1;
+			while (*args != '\0' && isspace((unsigned char)*args)) args++;
+			if (*args == '\0') {
+				query = "Based on context, suggest exactly one safe next parser command. Return only the command text.";
+			} else {
+				static char next_query[1024];
+				(void)snprintf(next_query, sizeof(next_query),
+				               "Goal: %s\nSuggest exactly one safe next parser command. Return only the command text.",
+				               args);
+				query = next_query;
+			}
+		} else {
+			return 0;
+		}
+	}
+
+#undef CMD_ARGS
+
+	print_string("\n[LLM] Waiting for response...\n");
+	refresh();
+
+	if (!llm_query_with_context(query, response, sizeof(response), error, sizeof(error))) {
+		print_string("\nLLM error: "); print_string(error); print_string("\n");
+		return 1;
+	}
+
+	if (next_mode) {
+		if (!llm_extract_next_command(response, next_cmd, sizeof(next_cmd))) {
+			print_string("\nLLM error: couldn't extract a parser command from /next response.\n");
+			return 1;
+		}
+		{
+			char linebuf[640];
+			(void)snprintf(linebuf, sizeof(linebuf), "\n[LLM->game] %s\n", next_cmd);
+			print_string(linebuf);
+		}
+		(void)strncpy((char *)buf, next_cmd, (size_t)bufmax);
+		((char *)buf)[bufmax] = '\0';
+		return 2;
+	}
+
+	{
+		char linebuf[128];
+		(void)snprintf(linebuf, sizeof(linebuf), "\n[LLM] (%ld ms, %d attempt%s) ",
+		               llm_last_latency_ms(),
+		               llm_last_attempts(),
+		               llm_last_attempts() == 1 ? "" : "s");
+		print_string(linebuf);
+	}
+	print_string(response); print_string("\n");
+	return 1;
+}
 
 static struct timeval global_timeout;
 
@@ -484,6 +719,7 @@ zchar os_read_line (int bufmax, zchar *buf, int timeout, int width,
                     int continued)
 {
     int ch, y, x, len = strlen( (char *)buf);
+	size_t n;
     const int margin = MAX(h_screen_width - width, 0);
 
     /* These are static to allow input continuation to work smoothly. */
@@ -501,6 +737,74 @@ zchar os_read_line (int bufmax, zchar *buf, int timeout, int width,
 	history_view = history_next; /* Reset user's history view. */
 	searchpos = -1;		/* -1 means initialize from len. */
 	insert_flag = 1;	/* Insert mode is now default. */
+    }
+
+    if (llm_agent_is_active()) {
+	char auto_cmd[512];
+	char status[2048];
+	char error[4096];
+	size_t n;
+
+	if (llm_agent_next_command(auto_cmd, sizeof(auto_cmd), status, sizeof(status), error, sizeof(error))) {
+		if (llm_command_looks_json(auto_cmd)) {
+			llm_agent_stop();
+			print_string("\nLLM agent error: rejected non-parser action.\n");
+			goto agent_done;
+		}
+		n = strlen(auto_cmd);
+		if (n > (size_t)bufmax)
+			n = (size_t)bufmax;
+		memcpy(buf, auto_cmd, n);
+		buf[n] = '\0';
+		addstr((char *)buf);
+		unix_add_to_history(buf);
+		refresh();
+		return ZC_RETURN;
+	}
+
+	if (status[0] != '\0') {
+		print_string("\n[LLM] ");
+		print_string(status);
+		print_string("\n");
+	}
+	if (error[0] != '\0') {
+		print_string("\nLLM agent error: ");
+		print_string(error);
+		print_string("\n");
+	}
+    }
+    agent_done:
+
+    if (llm_play_remaining > 0) {
+	char play_cmd[512];
+	char play_error[4096];
+	if (!llm_mode_is_interactive()) {
+		llm_play_remaining = 0;
+		print_string("\n[LLM] /play stopped: interactive mode disabled.\n");
+	} else {
+		print_string("\n[LLM] Waiting for response...\n");
+		refresh();
+		if (!llm_next_command_query(play_cmd, sizeof(play_cmd), play_error, sizeof(play_error))) {
+			llm_play_remaining = 0;
+			print_string("\nLLM error: "); print_string(play_error); print_string("\n");
+		} else {
+			char linebuf[768];
+			llm_play_remaining--;
+			(void)snprintf(linebuf, sizeof(linebuf), "\n[LLM->game] %s (%d move%s left)\n",
+			               play_cmd,
+			               llm_play_remaining,
+			               llm_play_remaining == 1 ? "" : "s");
+			print_string(linebuf);
+			n = strlen(play_cmd);
+			if (n > (size_t)bufmax)
+				n = (size_t)bufmax;
+			memcpy(buf, play_cmd, n);
+			buf[n] = '\0';
+			unix_add_to_history(buf);
+			refresh();
+			return ZC_RETURN;
+		}
+	}
     }
 
     unix_set_global_timeout(timeout);
@@ -671,6 +975,36 @@ zchar os_read_line (int bufmax, zchar *buf, int timeout, int width,
         }
 	if (is_terminator(ch)) {
 	    buf[len] = '\0';
+	    if (ch == ZC_RETURN) {
+		int runtime_action = handle_llm_runtime_line(buf, bufmax);
+		if (runtime_action == 2) {
+			len = (int)strlen((char *)buf);
+			scrpos = len;
+			searchpos = -1;
+			history_view = history_next;
+			unix_add_to_history(buf);
+			move(y, x + len);
+			return ZC_RETURN;
+		}
+		if (runtime_action == 1) {
+			len = 0;
+			scrpos = 0;
+			searchpos = -1;
+			buf[0] = '\0';
+			history_view = history_next;
+			if (llm_play_remaining > 0)
+				return ZC_BAD;
+			/* Re-print the game prompt so the cursor lands after it.
+			 * Use addch directly: print_string buffers until whitespace so
+			 * '>' would never flush; and we must NOT add an extra \n because
+			 * screen_new_line() (from the trailing \n in the output above)
+			 * already advanced the ncurses cursor to the start of a new row. */
+			addch('>');
+			refresh();
+			getyx(stdscr, y, x);
+			continue;
+		}
+	    }
 	    if (ch == ZC_RETURN)
 		unix_add_to_history(buf);
 	    /* Games don't know about line editing and might get
